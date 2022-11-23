@@ -1,0 +1,17 @@
+model{
+    for(i in 1:N) {
+    log(m[i])=a+b[Attack[i]]+c[Defence[i]]+d*HomeEffect[i]
+    Goal[i] ~ dpois(m[i])
+      }
+    for( i in 1:Ntest) {
+        log(mu_pred[i]) <- a+b[Attack_t[i]]+c[Defence_t[i]]+d*HomeEffect_t[i]
+    pred[i] ~ dpois(mu_pred[i])
+    }
+    a~dnorm(0, 200^(-2))
+    b[1] <- 0
+    c[1] <- 0
+    for(i in 2:20) {
+      b[i]~ dnorm(0, 200^(-2))
+      c[i]~ dnorm(0, 200^(-2))}
+    d~dnorm(0, 200^(-2))
+}

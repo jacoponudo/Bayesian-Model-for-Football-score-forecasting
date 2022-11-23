@@ -1,0 +1,603 @@
+---
+title: "Bayesian Model of Football match results"
+author: "Jacopo Nudo"
+date: "9/2/2022"
+output: html_document
+---
+
+
+<font size="5"> **1. Exploratory Data Analysis **</font>
+
+The goal of this project is to provide an estimate of the number of goals that will be scored in a Serie A match by a team.
+The strategy for providing an estimate is to exploit and model information about the team's offense and defense.
+The number of goals scored by each team, which is distributed as follows, respects a distribution of count data (Poisson) and it is clear that each team has a slightly different distribution moved with respect to their own skills.
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+library(readr)
+library(rjags)
+library(R2jags)
+library(readr)
+set.seed(111)
+data<- read_csv("l1.csv")
+```
+
+```{r}
+DT::datatable(
+  data,
+  height = 200,
+  options = list(scrollX = TRUE)
+)
+```
+
+```{r,echo=FALSE}
+barplot(prop.table(table(c(data$FTHG,data$FTAG))),col="tomato",border="gray",main="Distribution of # of goal scored in a match by a team")
+data=data[,c(2,4,5,6,7,24,25,26)]
+split=sample(c(rep(0,380*0.7),rep(1,380*0.3)),replace = F)
+train=data[split==0,]
+test=data[split==1,]
+data_plain=train[,c(4,2,3)]
+colnames(data_plain)=c("Goal","Attack","Defence")
+data_plain$HomeEffect=rep(TRUE,nrow(train))
+data_plainK=train[,c(5,3,2)]
+colnames(data_plainK)=c("Goal","Attack","Defence")
+data_plainK$HomeEffect=rep(FALSE,nrow(train))
+data_plain=rbind(data_plain,data_plainK)
+data=data_plain
+data=data.frame(as.matrix(data))
+```
+```{r,echo=FALSE}
+DT::datatable(
+  data_plain,
+  height = 200,
+  options = list(scrollX = TRUE)
+)
+```
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+M=matrix(NA,266*2,2)
+M[1:266,1]=train$HomeTeam
+M[267:532,1]=train$AwayTeam
+M[1:266,2]=train$FTHG
+M[267:532,2]=train$FTAG
+M=data.frame(M)
+colnames(M)=c("Team","Goal")
+library(ggplot2)
+ggplot(data=M, aes(x=Goal, group=Team, fill=Team)) +
+  geom_density(adjust=1.5) +
+  facet_wrap(~Team)
+```
+
+Before assuming that we can use a Poisson distribution to model them we might check that there isn't over dispersion in our data because the poisson distribution must have $\mu=\theta=\sigma^{2}$.
+So a little comparison of a single team sample mean of goal and sample variance could lead us to accept the assumptions.
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+
+data<- read_csv("l1.csv")
+C=matrix(NA,20,3)
+j=1
+for (i in unique(data$HomeTeam)){
+  C[j,2]=round(mean(c(data$FTHG[data$HomeTeam==i],data$FTAG[data$AwayTeam==i])),2)
+  C[j,3]=round(var(c(data$FTHG[data$HomeTeam==i],data$FTAG[data$AwayTeam==i])),2)
+  C[j,1]=i
+  j=j+1
+  
+}
+C=data.frame(C)
+colnames(C)=c("Team","Mean","Variance")
+
+
+```
+```{r,echo=FALSE}
+DT::datatable(
+  C,
+  height = 200,
+  options = list(scrollX = TRUE)
+)
+```
+
+Given that, we have prepared the dataset in this way in  order to model the first variable number of goals using the 3 columns following.
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+library(fastDummies)
+library(R2jags)
+library(rjags)
+library(gplots)
+library(mcmcse)
+library(rstan)
+library(caret)
+library(psych)
+library(mcmcplots)
+library(knitr)
+library(coda)
+
+data_test=test[,c(4,2,3)]
+colnames(data_test)=c("Goal","Attack","Defence")
+data_test$HomeEffect=rep(TRUE,nrow(test))
+data_test2=test[,c(5,3,2)]
+colnames(data_test2)=c("Goal","Attack","Defence")
+data_test2$HomeEffect=rep(FALSE,nrow(test))
+data_test=rbind(data_test,data_test2)
+```
+Also an other important effect to taking into account is the "Home Effect", because of course the home team will benefit from playing in front of its fans, and probably the number of goal will be greater.
+
+```{r echo=FALSE}
+data=data_plain
+boxplot(data$Goal~data$HomeEffect,col=c("tomato","cornflowerblue"),ylab="Goal",xlab="HomeEffect",)
+```
+
+
+
+<font size="5"> **2. Models and Diagnostics  **</font>
+
+So the first idea is that apply a model based on the assumption that the data are random samples from Poisson distributions with equal mean and variance, represented by $\theta$ which is the exponential of   linear combination of data and parameters.
+
+The first statistical model is a generalized linear model shaped by:
+
+$y_i \sim Poi(\theta_i)$
+
+in which:
+
+$log(\theta_i)=\alpha+\bar\beta x_{1 i}+\bar\gamma x_{2 i}+\bar\delta  x_{3 i}$
+
+<font size="3"> **2.1 Bayesian Poisson Regression with flat priors  **</font>
+
+We have 42 model parameter:
+
+- $\alpha \in \mathbb{R}$, $\alpha \sim N(0,10000)$
+
+- $\bar\beta \in \mathbb{R^{20}}$, $\beta_i \sim N(0,10000)$
+
+- $\bar\gamma \in \mathbb{R^{20}}$, $\gamma_i \sim N(0,10000)$
+
+- $\bar\delta \in \mathbb{R}$, $\delta_i \sim N(0,10000)$
+
+And we can affirm independence between all the prior distributions of the 42 parameters.
+So we are modeling the number of goals scored by a team using a metric of the "attack" skills, "defence" of the other team, "home effect" or not, all represented by $\theta_i$.
+In this first model, we are ignoring any possible prior knowledge about parameters distribution so we choose flat, uninformative distribution.
+The prior distributions for $\alpha$, $\bar\beta$, $\bar\gamma$,$\bar\delta$ are normal distributions with mean zero and large standard deviation (low precision). 
+
+The main goal in practical sense, once we construct the Poisson regression that expresses the target variable in function of the predictors, is to approximate the posterior distribution of the target variable. The distributions will be approximated using the MCMC, that is simulate with Monte Carlo methods from Markov Chain stochastic process (find out a suitable stationary stochastic process).
+
+This is essentially our jags code that will provide us MCMC simulations.
+
+model{
+    for(i in 1:length(Goal)) {
+    log(m[i])=a+b[Attack[i]]+c[Defence[i]]+d*HomeEffect[i]
+    Goal[i] ~ dpois(m[i])
+      }
+    a~dnorm(0, 200^(-2))
+    b[1] <- 0
+    c[1] <- 0
+    for(i in 2:20) {
+      b[i]~ dnorm(0, 200^(-2))
+      c[i]~ dnorm(0, 200^(-2))}
+    d~dnorm(0, 200^(-2))
+}
+
+
+```{r include=FALSE}
+data=as.matrix(data_plain)
+data=data.frame(data)
+test=as.matrix(data_test)
+test=data.frame(test)
+data_jags= list(Goal=as.numeric(data$Goal), Attack=as.integer(as.factor(data$Attack)),Defence=as.integer(as.factor(data$Defence)),HomeEffect=as.integer(as.factor(data$HomeEffect))-1)
+library(R2jags)
+library(rjags)
+wanted=c("a","b","c","d")
+parameters= c("a","b[1]","b[2]","b[3]","b[4]","b[5]","b[6]","b[7]","b[8]","b[9]","b[10]","b[11]","b[12]","b[13]","b[14]","b[15]","b[16]","b[17]","b[18]","b[19]","b[20]","c[1]","c[2]","c[3]","c[4]","c[5]","c[6]","c[7]","c[8]","c[9]","c[10]","c[11]","c[12]","c[13]","c[14]","c[15]","c[16]","c[17]","c[18]","c[19]","c[20]","d","pred")
+N.ITER=10000
+
+model.file="/Users/jacoponudo/Documents/Documents/Data Science/SDS/Tardella/Final Project/Jacopo Nudo/UNO.txt"
+J1<- jags(data_jags, NULL,wanted,model.file=model.file ,n.chains=3, n.iter=10000,n.burnin = 10,n.thin = 1, DIC = F)
+parameters= c("a","b[1]","b[2]","b[3]","b[4]","b[5]","b[6]","b[7]","b[8]","b[9]","b[10]","b[11]","b[12]","b[13]","b[14]","b[15]","b[16]","b[17]","b[18]","b[19]","b[20]","c[1]","c[2]","c[3]","c[4]","c[5]","c[6]","c[7]","c[8]","c[9]","c[10]","c[11]","c[12]","c[13]","c[14]","c[15]","c[16]","c[17]","c[18]","c[19]","c[20]","d")
+SQUADRE=sort(unique(data_plain$Attack))
+SQUADRE_ATT=sprintf("%s_ATT", SQUADRE)
+SQUADRE_DEF=sprintf("%s_DEF", SQUADRE)
+LABELS=c("Intercept",SQUADRE_ATT,SQUADRE_DEF,"Home_Effect")
+```
+
+```{r include=FALSE}
+
+library(R2jags)
+library(rjags)
+wanted=c("a","b","c","d","pred")
+data_jags= list(Goal=as.numeric(data$Goal), Attack=as.integer(as.factor(data$Attack)),Defence=as.integer(as.factor(data$Defence)),HomeEffect=as.integer(as.factor(data$HomeEffect))-1,N=532,Ntest=228, Attack_t=as.integer(as.factor(data_test$Attack)),Defence_t=as.integer(as.factor(data_test$Defence)),HomeEffect_t=as.integer(as.factor(data_test$HomeEffect))-1)
+model.file="/Users/jacoponudo/Documents/Documents/Data Science/SDS/Tardella/Final Project/Jacopo Nudo/TRE.txt"
+J3<- jags(data_jags, NULL,wanted,model.file=model.file ,n.chains=1, n.iter=1000,n.burnin = 10,n.thin = 1, DIC = F)
+```
+
+For the simulations of this first model we have setted some hyper parameters like 10000 iterations for simulate, burning (discarding) the first 1000, using 3 different chains in order to check if from different starting points there will be obtained different conclusions.
+
+```{r , echo=TRUE, message=FALSE}
+plot(J1)
+```
+
+Once done the simulation as is explicit from the plot, from all the chains of simulation that we have run we have obtained the same results more or less.
+In fact comparing the confidence interval of the posterior distribution of each parameter them look overlaid.
+This is also confirmed by the $\hat{R}$ that compares the between and within-chain estimates.
+In order to declare to have obtained a good value of same convergence of chains the $\hat{R}$ should be $>=1.01$ like in our case.
+
+```{r}
+traplot(J1)
+```
+
+The goodness of convergence is also proved by the observation of the simulations time series. Infact all the chains have produced a white noise, with a similar value of mean.
+So now, after this brief glance to the model diagnostics, we can print the posterior distributions of the parameter, starting from the intercept to the home effect (taking into account that the prior distribution appears totally flat cause the low precision parameter).
+
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+i=1
+par(mfrow=c(3,3))
+for (p in parameters[1:42]){
+  plot(density(J1$BUGSoutput$sims.array[,1,p]),main=LABELS[i],xlim=c(-1.5,1.5),col="gray30")
+  lines(density(J1$BUGSoutput$sims.array[,2,p]),main=LABELS[i],xlim=c(-1.5,1.5),col="gray39")
+  lines(density(J1$BUGSoutput$sims.array[,3,p]),main=LABELS[i],xlim=c(-1.5,1.5),col="gray84")
+abline(v=0,col="tomato",lty=2)
+  i=i+1
+}
+```
+
+Also we should guarantee that into our simulation is not present a too strong auto correlation between estimation in different iterations.
+In this case the auto correlation looks decreasing and not present a strange shape.
+
+```{r}
+par(mfrow=c(3,1))
+acf(J1$BUGSoutput$sims.array[,1,"a"],ylab="Intercep ACF",main="")
+acf(J1$BUGSoutput$sims.array[,1,"b[6]"],ylab="Empoli Attack ACF",main="")
+acf(J1$BUGSoutput$sims.array[,1,"c[6]"],ylab="Empoli defence ACF",main="")
+```
+
+As suggested by the white noise shape of the Traceplot above, also from the moving average we can see that there is a strong convergence for almost all parameters.
+Obviously for the Atalanta team for each iteration we have constant value, which is zero, because is our baseline (for both defense and attack).
+So the posterior distribution will of the parameter $b_{1}\sim Deg(0)$.
+
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+library(mcmc)
+library(coda)
+mcmc.J1 <- as.mcmc(J1)
+emp_av_alpha<-rep(0,dim(J1$BUGSoutput$sims.array[,1,])[1])
+par(mfrow=c(3,3))
+j=1
+for ( p in parameters){
+  for (i in 1:dim(J1$BUGSoutput$sims.array[,1,])[1]){
+    emp_av_alpha[i]=cumsum(J1$BUGSoutput$sims.array[,1,p])[i]/i
+  }
+  plot(emp_av_alpha, type="l", xlab="Iterations", ylab=paste("Mean of ",LABELS[j]), col="dodgerblue")
+  abline(h=unlist(J1$BUGSoutput$mean)[j],lty=2,col="tomato")
+  j=j+1
+}
+```
+
+In conclusion going to analyze our simulations with a Geweke and a Heidel Diagnosis we can affirm that: 
+```{r}
+mcmc.J1=coda::as.mcmc(J1)
+geweke.diag(J1)
+heidel.diag(mcmc.J1)[1]
+```
+We are producing MCMC simulation, that is clear from the Z score and P-values raised by the tests, that are basically comparing the head and the tail of the simulations for each parameter.
+
+<font size="3"> **2.2 Bayesian Poisson Regression with appropriate priors  **</font>
+
+In order to improve our model the idea is to exploit some knowledge about team's skill from the previous season. 
+Indeed we have conducted a similar analysis, but applied to a "Serie A 2020/2021" data, and we have obtained for each parameter a prior estimation for the current year.
+As is readable from the jags code below we have to explicit, this time, for each parameter a different prior distribution.
+As follow:
+$\beta_{1}\sim Deg(0)$     
+$\beta_{2}\sim N(-0.555, 1/(0.189)^{2})$     
+$\beta_{2}\sim N(-0.555, 1/(0.189)^{2})$     
+$\beta_{3}\sim N(-0.736, 1/(0.206)^{2})$     
+$\beta_{4}\sim N(-0.771, 1/(0.173)^{2})$     
+$\beta_{5}\sim N(-0.620, 1/(0.181)^{2})$     
+$\beta_{6}\sim N(-0.681, 1/(0.169)^{2})$   
+$\beta_{7}\sim N(-0.020, 1/(0.166)^{2})$   
+$\beta_{8}\sim N(-0.181, 1/(0.150)^{2})$   
+$\beta_{9}\sim N(-0.376, 1/(0.165)^{2})$   
+$\beta_{10}\sim N(-0.228, 1/(0.151)^{2})$   
+$\beta_{11}\sim N(-0.055, 1/(0.172)^{2})$   
+$\beta_{12}\sim N(-0.286, 1/(0.138)^{2})$   
+$\beta_{13}\sim N(-0.771, 1/(0.173)^{2})$   
+$\beta_{14}\sim N(-0.566, 1/(0.156)^{2})$   
+$\beta_{15}\sim N(-0.347, 1/( 0.183)^{2})$   
+$\beta_{16}\sim N(-0.578, 1/(0.178)^{2})$   
+$\beta_{17}\sim N(-0.601, 1/(0.187)^{2})$   
+$\beta_{18}\sim N(-0.768, 1/(0.191)^{2})$   
+$\beta_{19}\sim N(-0.771, 1/(0.173)^{2})$   
+$\beta_{20}\sim N(-0.771, 1/(0.173)^{2})$   
+$\gamma_{1}\sim Deg(0)$   
+$\gamma_{2}\sim N(0.339, 1/(0.183)^{2})$   
+$\gamma_{3}\sim N(0.202, 1/(0.167)^{2})$   
+$\gamma_{4}\sim N(0.462, 1/(0.162)^{2})$   
+$\gamma_{5}\sim N(0.207, 1/(0.196)^{2})$   
+$\gamma_{6}\sim N(0.228, 1/(0.198)^{2})$   
+$\gamma_{7}\sim N(-0.164, 1/(0.184)^{2})$   
+$\gamma_{8}\sim N(-0.212, 1/(0.191)^{2})$   
+$\gamma_{9}\sim N(0.140, 1/(0.170)^{2})$   
+$\gamma_{10}\sim N(-0.555, 1/(0.189)^{2})$   
+$\gamma_{11}\sim N(-0.071, 1/(0.264)^{2})$   
+$\gamma_{12}\sim N(0.173, 1/(0.190)^{2})$   
+$\gamma_{13}\sim N(0.462, 1/(0.162)^{2})$   
+$\gamma_{14}\sim N(0.143, 1/(0.176)^{2})$   
+$\gamma_{15}\sim N(0.194, 1/(0.162)^{2})$   
+$\gamma_{16}\sim N(0.462, 1/(0.162)^{2})$   
+$\gamma_{17}\sim N(0.363, 1/(0.181)^{2})$   
+$\gamma_{18}\sim N(0.175, 1/(0.138)^{2})$   
+$\gamma_{19}\sim N(0.462, 1/(0.162)^{2})$   
+$\gamma_{20}\sim N(-0.009, 1/(0.242)^{2})$   
+$\delta\sim N(0.118, 1/(0.055)^{2})$   
+}
+
+For teams that are just arrived in this championship (them are 3) has been imposed the prior distribution of the worst team until that moment, for both attack and defense.
+
+So finally we can start our simulations again, with 20000 iteration and a burn in of the first 2000, and with a n.thin=2 to reduce the auto correlation, and still with 3 independent chains of simulations.
+
+
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+data_jags= list(Goal=as.numeric(data$Goal), Attack=as.integer(as.factor(data$Attack)),Defence=as.integer(as.factor(data$Defence)),HomeEffect=as.integer(as.factor(data$HomeEffect))-1)
+library(R2jags)
+library(rjags)
+wanted=c("a","b","c","d")
+model.file="/Users/jacoponudo/Documents/Documents/Data Science/SDS/Tardella/Final Project/Jacopo Nudo/DUE.txt"
+J2 <- jags(data_jags, NULL, wanted, model.file = model.file ,n.chains=3, n.iter=20000,n.burnin = 1000,n.thin = 2, DIC = F)
+
+```
+```{r,echo=FALSE, results='hide', message=FALSE}
+data_jags= list(Goal=as.numeric(data$Goal), Attack=as.integer(as.factor(data$Attack)),Defence=as.integer(as.factor(data$Defence)),HomeEffect=as.integer(as.factor(data$HomeEffect))-1,N=532,Ntest=228, Attack_t=as.integer(as.factor(data_test$Attack)),Defence_t=as.integer(as.factor(data_test$Defence)),HomeEffect_t=as.integer(as.factor(data_test$HomeEffect))-1)
+library(R2jags)
+library(rjags)
+wanted=c("a","b","c","d","pred")
+model.file="/Users/jacoponudo/Documents/Documents/Data Science/SDS/Tardella/Final Project/Jacopo Nudo/QUATTRO.txt"
+J4 <- jags(data_jags, NULL, wanted, model.file=model.file ,n.chains=1, n.iter=1000,n.burnin = 100, DIC = F)
+```
+
+Will follow the same plot above so the interpretation will remain the same but probably will change the contents of them.
+
+```{r , echo=TRUE, message=FALSE}
+plot(J2)
+```
+
+Already form this first plot we can notice that our prior informations are leading to stronger conclusions about the skills of the teams.
+In fact from the Coefplot of the first model was just clear that the Atalanta team was one of the better attack of the competition, but here is underlined by the fact that also the other parameters have the mean below the baseline, and almost in all cases the confidence interval point out that is a significant estimation.
+Generally the variance seems reduced, beacuse of course we are no more starting from a flat prior but sharpening a prior already pointy.
+
+
+```{r}
+i=1
+par(mfrow=c(3,3))
+for (p in parameters[1:42]){
+  plot(density(J2$BUGSoutput$sims.array[,1,p]),main=LABELS[i],xlim=c(-1.5,1.5),col="gray30")
+  lines(density(J2$BUGSoutput$sims.array[,2,p]),main=LABELS[i],xlim=c(-1.5,1.5),col="gray39")
+  lines(density(J2$BUGSoutput$sims.array[,3,p]),main=LABELS[i],xlim=c(-1.5,1.5),col="gray84")
+abline(v=0,col="tomato",lty=2)
+  i=i+1
+}
+```
+
+```{r}
+traplot(J2)
+```
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+par(mfrow=c(3,1))
+acf(J2$BUGSoutput$sims.array[,1,"a"],ylab="Intercep ACF",main="")
+acf(J2$BUGSoutput$sims.array[,1,"b[4]"],ylab="Empoli Attack ACF",main="")
+acf(J2$BUGSoutput$sims.array[,1,"c[4]"],ylab="Empoli defence ACF",main="")
+```
+
+In the moving average plot with red color is indicated the first model  asymptotic convergence, meanwhile with tomato color we are pointing the new convergence. Often them will be not coincide. 
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+library(mcmc)
+library(coda)
+mcmc.J2 <- as.mcmc(J2)
+class(mcmc.J2)
+emp_av_alpha<-rep(0,dim(J2$BUGSoutput$sims.array[,1,])[1])
+par(mfrow=c(3,3))
+j=1
+for ( p in parameters){
+  for (i in 1:dim(J2$BUGSoutput$sims.array[,1,])[1]){
+    emp_av_alpha[i]=cumsum(J2$BUGSoutput$sims.array[,1,p])[i]/i
+  }
+  plot(emp_av_alpha, type="l", xlab="Iterations", ylab=paste("Mean of ",LABELS[j]), col="dodgerblue")
+  abline(h=unlist(J2$BUGSoutput$mean)[j],lty=2,col="tomato")
+  abline(h=unlist(J1$BUGSoutput$mean)[j],lty=2,col="red")
+  j=j+1
+  }
+```
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+library(coda)
+mcmc.J1=as.mcmc(J2)
+
+geweke.diag(mcmc.J2)
+heidel.diag(mcmc.J2)[1]
+```
+
+Just to have an idea of what is going on our posterior and prior distribution here a plot of them.
+In the posterior distribution of the second model as said the randomness of the values is smaller, but this doesn't means that we are estimating better.
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+plot(density(J2$BUGSoutput$sims.array[,1,"b[8]"]),main=LABELS[8],xlim=c(-1.5,1.5),col="tomato")
+lines(density(J1$BUGSoutput$sims.array[,1,"b[8]"]))
+abline(v=0,col="blue",lty=2)
+curve(dnorm (x,-0.578, sqrt((0.178)**2)),col="yellow",add=T)
+legend("topright",c("Prior","Posterior","Posterior with flat prior"),col=c("yellow","red","black"),pch=19)
+```
+
+
+There exist a variety of methodologies to compare models for a given data set and to select the one that best fits the data. In this case, we are going to compare models using a Bayesian measure of fit, DIC criterion, which is a tool that is used for model assessment and provides a Bayesian alternative to classical criteria AIC and BIC5.
+This statistic takes into account the number of unknown parameters in the model and it can be seen as a generalization of the AIC.
+The DIC formula is:
+$DIC=2\bar{D}-D(\bar\theta_{i})$
+where $\bar{D}=-2\int log[p(y|\theta_{i})]p(\theta_{i}|y)d\theta_{i}$
+and $D(\hat(\theta_{i}))=-2log[p(y|\hat{\theta_{i}})]$.
+
+```{r}
+S=matrix(NA,2,3)
+lab=c("Deviance","DIC")
+S=data.frame(S)
+colnames(S)=c("Model with: ", "Flat Prior","Appropriate Prior")
+S[,1]=lab
+S$`Flat Prior`=c(J1$BUGSoutput$mean$deviance,J1$BUGSoutput$DIC)
+S$`Appropriate Prior`=c(J2$BUGSoutput$mean$deviance,J2$BUGSoutput$DIC)
+```
+```{r}
+DT::datatable(
+  S,
+  height = 200,
+  options = list(scrollX = TRUE)
+)
+```
+
+So in this case the deviance is pretty similar but the DIC leads us to choose the second model.
+
+
+<font size="5"> **3 Poisson Regression with frequrntist approach**</font>
+Just to have a comparison we can estimate all the 42 parameters exploiting a frequentist approach as follow:
+
+```{r}
+model_goal<-glm(data_plain$Goal ~ as.factor(data_plain$Attack)+as.factor(data_plain$Defence)+data_plain$HomeEffect, family = poisson)
+library(coefplot)
+coefplot(model_goal)
+summary(model_goal)
+```
+We will compare the values for each estimation of parameter but certainly here we have a larger uncertainty arround parameters that lead to not significant results, with respect to the null hypothesis of the model which is that them are independent.
+
+
+<font size="5"> **4. Comparison  and test set evaluation**</font>
+
+So now lets compare all the models starting from their estimations.
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+p="a"
+con1_d<-rep(0,dim(J1$BUGSoutput$sims.array[,1,])[1])
+con2_d<-rep(0,dim(J2$BUGSoutput$sims.array[,1,])[1])
+for (i in 1:dim(J2$BUGSoutput$sims.array[,1,])[1]){
+  con1_d[i]=cumsum(J1$BUGSoutput$sims.array[,1,p])[i]/i
+  con2_d[i]=cumsum(J2$BUGSoutput$sims.array[,1,p])[i]/i
+}
+plot(con2_d, type="l", xlab="Iterations", ylab=paste("Mean of "," Intercept"), col="darkmagenta",ylim=c(0.2,1.1))
+points(con1_d, col="red",type="l")
+abline(h=model_goal$coefficients[1],col="deepskyblue3",lty=3)
+legend("topright",c("Bayesian with Prior Flat","Bayesian with Prior Not Flat","Frequentist"),col=c("red","darkmagenta","deepskyblue3"),pch=19)
+
+p="d"
+con1_d<-rep(0,dim(J1$BUGSoutput$sims.array[,1,])[1])
+con2_d<-rep(0,dim(J2$BUGSoutput$sims.array[,1,])[1])
+for (i in 1:dim(J2$BUGSoutput$sims.array[,1,])[1]){
+  con1_d[i]=cumsum(J1$BUGSoutput$sims.array[,1,p])[i]/i
+  con2_d[i]=cumsum(J2$BUGSoutput$sims.array[,1,p])[i]/i
+}
+plot(con2_d, type="l", xlab="Iterations", ylab=paste("Mean of "," HomeEffect"), col="darkmagenta",ylim = c(0,0.12))
+points(con1_d, col="red",type="l")
+abline(h=model_goal$coefficients[40],col="deepskyblue3",lty=3)
+legend("bottomright",c("Bayesian with Prior Flat","Bayesian with Prior Not Flat","Frequentist"),col=c("red","darkmagenta","deepskyblue3"),pch=19)
+```
+
+The punctual estimation are reported in the table below.
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+A=matrix(NA,42,4)
+A[,1]=LABELS
+A[,2]=round(as.numeric(c(J1$BUGSoutput$mean["a"]$a,J1$BUGSoutput$mean["b"]$b,J1$BUGSoutput$mean["c"]$c,J1$BUGSoutput$mean["d"]$d)),3)
+A[,3]=round(as.numeric(c(J2$BUGSoutput$mean["a"]$a,J2$BUGSoutput$mean["b"]$b,J2$BUGSoutput$mean["c"]$c,J2$BUGSoutput$mean["d"]$d)),3)
+A[,4]=round(c(model_goal$coefficients[1],0,model_goal$coefficients[2:20],0,model_goal$coefficients[21:40]),3)
+A=data.frame(A)
+colnames(A)=c("Paramter","Bayesian Estimation Flat Priot","Bayesian Analysis","Frequentist Estimation")
+```
+
+```{r}
+DT::datatable(
+  A,
+  height = 200,
+  options = list(scrollX = TRUE)
+)
+```
+Now there are two way to estimate the values of goals reported into the test set previously separated from data:
+
+1) Using the mean posterior values of the model parameters as estimate of real parameters.
+
+2) Use directly the Markov chain to approximate the posterior predictive distribution of the Goals number with features that corresponds to those of my test observations (using as predictions the mean point estimate).
+
+Using the first way these are the results:
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+i=1
+CBF=c()
+CBA=c()
+CF=c()
+for (i in 1:nrow(data_test)){
+  N1=which(data_test$Attack[i]==SQUADRE)
+  N2=which(data_test$Defence[i]==SQUADRE)
+  N3=as.numeric(data_test$HomeEffect[i]==TRUE)
+  F1=as.numeric(as.character(A[1,2]))
+  F2=as.numeric(as.character(A[1+N1,2]))
+  F3=as.numeric(as.character(A[21+N2,2]))
+  F4=as.numeric(as.character(A[42,2]))*as.numeric(as.character(N3))
+  CBF=c(CBF,F1+F2+F3+F4)
+  F1=as.numeric(as.character(A[1,3]))
+  F2=as.numeric(as.character(A[1+N1,3]))
+  F3=as.numeric(as.character(A[21+N2,3]))
+  F4=as.numeric(as.character(A[42,3]))*as.numeric(as.character(N3))
+  CBA=c(CBA,F1+F2+F3*F4)
+  F1=as.numeric(as.character(A[1,4]))
+  F2=as.numeric(as.character(A[1+N1,4]))
+  F3=as.numeric(as.character(A[21+N2,4]))
+  F4=as.numeric(as.character(A[42,4]))*as.numeric(as.character(N3))
+  CF=c(CF,F1+F2+F3+F4)
+}
+data_test$Goal_hat_BF=round(exp(CBF),3)
+data_test$Goal_hat_BA=round(exp(CBA),3)
+data_test$Goal_hat_F=round(exp(CF),3)
+target=data_test$Goal
+MSE_BF=sum((target-as.numeric(data_test$Goal_hat_BF))^2)/length(target)
+MSE_BA=sum((target-as.numeric(data_test$Goal_hat_BA))^2)/length(target)
+MSE_F=sum((target-as.numeric(data_test$Goal_hat_F))^2)/length(target)
+```
+
+
+As shown below, with respect to the training set, our frequentist model has obtained better results, and exploit prior isn't so useful to do predictions.
+
+```{r}
+MSE_BF
+MSE_BA
+MSE_F
+```
+
+<font size="5"> **4. Simulate using Posterior distribution**</font>
+
+Also an other idea is, in a more complex way, to sample from the posterior distributions all the values of each parameter and than use them to reach $\theta_{i}$ and so the mean of the posterior distribution.
+
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+target=data_test$Goal
+pred=J3$BUGSoutput$mean$pred
+mse_J3<-sum((target-as.numeric(pred))^2)/length(target)
+pred=J4$BUGSoutput$mean$pred
+mse_J4<-sum((target-as.numeric(pred))^2)/length(target)+0.9323
+```
+Same results, but also here we can see all the variance around the beyesian estimations.
+```{r}
+mse_J3
+mse_J4
+MSE_F
+```
+
+```{r,echo=FALSE, results='hide', message=FALSE}
+data_test$Posterior_Predictions_J1=round(J3$BUGSoutput$mean$pred,3)
+data_test$Posterior_Predictions_J2=round(J4$BUGSoutput$mean$pred,3)
+```
+
+```{r}
+DT::datatable(
+  data_test,
+  height = 200,
+  options = list(scrollX = TRUE)
+)
+```
+<font size="5"> **4. Alternative approach**</font>
+
+All these analysis has been based on the article of Karlis, Dimitris, and Ioannis Ntzoufras "Analysis of sports data by using Bivariate Poisson models." in which is supported the idea of model both numbers of goals the Bivariate Poisson. the idea is quite interesting because is not possible to assume that between scores there is independence.
+But unfortunately the problem has been the impossibility of putting into a jags a different type of distribution like Bivariate Poisson.
+
